@@ -23,7 +23,8 @@ const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASS = process.env.MEGA_PASS;
 
 // Bot Version for welcome message
-const BOT_VERSION = "King-MD Session Bot v1.2.1 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
+const BOT_VERSION = "King-MD Session Bot v1.2.3 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
+const MAX_RECONNECT_ATTEMPTS = 5; // ⭐ NEW: Max reconnect attempts for transient disconnects
 
 // --- Initialize Telegram Bot ---
 if (!TELEGRAM_BOT_TOKEN) {
@@ -133,10 +134,9 @@ function removeFile(FilePath) {
 }
 
 // Global variable to store active pairing processes by chat ID
-// Will store { sock: BaileysInstance, sessionPath: string, isCancelling: boolean, method: 'code'|'qr', lastPairingInfoSent: { type: 'qr' | 'code' | 'session_id', value: string, timestamp: Date } | null }
+// Will store { sock: BaileysInstance, sessionPath: string, isCancelling: boolean, method: 'code'|'qr', lastPairingInfoSent: { type: 'qr' | 'code' | 'session_id', value: string, timestamp: Date } | null, reconnectAttempts: number }
 const activePairings = new Map();
 
-// ⭐ UPDATED: startPairing now uses @whiskeysockets/baileys logic
 async function startPairing(chatId, num, method = 'code', isReconnect = false) {
     if (activePairings.has(chatId) && !isReconnect) {
         await telegramBot.sendMessage(chatId, "🚫 A pairing process is already active for this chat. Please wait for it to complete or use /cancel to stop it.", { parse_mode: 'Markdown' });
@@ -150,7 +150,6 @@ async function startPairing(chatId, num, method = 'code', isReconnect = false) {
         fs.mkdirSync('./temp_sessions');
     }
 
-    // ⭐ CRITICAL CHANGE: ONLY REMOVE SESSION PATH IF IT'S A NEW (NON-RECONNECT) ATTEMPT
     if (!isReconnect) {
         removeFile(sessionPath);
     } else {
@@ -160,41 +159,41 @@ async function startPairing(chatId, num, method = 'code', isReconnect = false) {
             logger.info(`Reconnecting using existing session path: ${sessionPath} for chat ${chatId}`);
         } else {
             logger.error(`Logic error: isReconnect true but no existing sessionPath found for chat ${chatId}. Treating as new.`);
-            removeFile(sessionPath); // Ensure clean slate if we're forced to make a new path unexpectedly
+            removeFile(sessionPath);
         }
     }
     
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const { version } = await fetchLatestBaileysVersion(); // NEW: Fetch latest Baileys version
+    const { version } = await fetchLatestBaileysVersion();
 
-    let sock; // Renamed from King to sock for @whiskeysockets/baileys
-    let currentPairingInMainScope; // Declared here to be available throughout the try block
+    let sock;
+    let currentPairingInMainScope;
 
     try {
-        sock = makeWASocket({ // Updated from King_Tech to makeWASocket
-            version, // Using fetched version
+        sock = makeWASocket({
+            version,
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
-            printQRInTerminal: false, // Don't print QR to terminal, we'll send to Telegram
+            printQRInTerminal: false,
             logger: logger,
-            // ⭐ UPDATED BROWSER AGENT
             browser: ['Ubuntu', 'Chrome', '121.0.6167.85'], 
-            connectTimeoutMs: 60000 // 60s timeout for initial connection
+            connectTimeoutMs: 60000
         });
 
-        // Store or update the active pairing details
+        // ⭐ UPDATED: Initialize reconnectAttempts
         if (!isReconnect) {
-            activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null });
+            activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null, reconnectAttempts: 0 });
         } else {
             const existingEntry = activePairings.get(chatId);
             if (existingEntry) {
                 existingEntry.sock = sock;
+                // Preserve existing reconnectAttempts count
                 activePairings.set(chatId, existingEntry);
             } else {
                 logger.error(`Logic error: isReconnect true but no active pairing found for chat ${chatId}. Treating as new.`);
-                activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null });
+                activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null, reconnectAttempts: 0 });
             }
         }
 
@@ -234,6 +233,7 @@ async function startPairing(chatId, num, method = 'code', isReconnect = false) {
             if (connection === "connecting") {
                 await telegramBot.sendMessage(chatId, "🔄 WhatsApp connection status: *Connecting...* Please wait.", { parse_mode: 'Markdown' });
             } else if (connection === "open") {
+                currentPairing.reconnectAttempts = 0; // Reset attempts on successful connection
                 await telegramBot.sendMessage(chatId, "✅ WhatsApp connection status: *Connected!* Your device is now linked.", { parse_mode: 'Markdown' });
                 logger.info(`WhatsApp connection opened successfully for chat ${chatId}.`);
 
@@ -339,9 +339,23 @@ ______________________________
                     return; 
                 }
                 else { 
-                    messageToUser += `Reason: _Temporary connection issue with WhatsApp (Status ${statusCode || 'Unknown'} - ${reasonText}). Attempting to reconnect automatically..._\n`;
-                    await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
-                    logger.warn(`Transient disconnect for chat ${chatId}. Full disconnect object:`, lastDisconnect);
+                    // ⭐ NEW: Handle transient disconnects with a retry limit
+                    currentPairing.reconnectAttempts++;
+                    logger.warn(`Transient disconnect for chat ${chatId}. Attempt ${currentPairing.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}. Full disconnect object:`, lastDisconnect);
+
+                    if (currentPairing.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                        messageToUser += `Reason: _Persistent temporary connection issue (Status ${statusCode || 'Unknown'} - ${reasonText}). Max reconnection attempts reached._\n`;
+                        messageToUser += `Please try pairing again with \`${currentPairing.method === 'qr' ? '/qr' : '/code <number>'}\` for a fresh session.`;
+                        await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
+                        // Clean up and delete active pairing on persistent transient disconnect
+                        await sock.logout(); // Explicit logout to ensure Baileys cleans up internally
+                        removeFile(sessionPath);
+                        activePairings.delete(chatId);
+                    } else {
+                        messageToUser += `Reason: _Temporary connection issue with WhatsApp (Status ${statusCode || 'Unknown'} - ${reasonText}). Attempting to reconnect automatically (Attempt ${currentPairing.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})..._\n`;
+                        await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
+                        // Allow Baileys' internal retry mechanism to work.
+                    }
                 }
                 return; 
             }
@@ -364,7 +378,9 @@ ______________________________
 
                         await telegramBot.sendMessage(chatId, "📸 Please scan this QR code with your WhatsApp app:", { parse_mode: 'Markdown' });
                         await telegramBot.sendPhoto(chatId, tempQrPath, { // Send local file path
-                            caption: "WhatsApp QR Code (expires in 60 seconds)"
+                            caption: "WhatsApp QR Code (expires in 60 seconds)",
+                            filename: 'whatsapp_qr.png', // ⭐ RE-ADDED: Explicit filename
+                            contentType: 'image/png'     // ⭐ RE-ADDED: Explicit content type
                         });
                         await telegramBot.sendMessage(chatId, "_If this QR code expires or you're having trouble scanning, a new one will be sent if the connection permits._", { parse_mode: 'Markdown' });
                         currentPairing.lastPairingInfoSent = { type: 'qr', value: qr, timestamp: new Date() };
@@ -510,7 +526,6 @@ telegramBot.onText(/\/cancel/, async (msg) => {
         activePairing.isCancelling = true;
 
         try {
-            // Renamed activePairing.King to activePairing.sock
             if (activePairing.sock && activePairing.sock.ws && activePairing.sock.ws.readyState === activePairing.sock.ws.OPEN) {
                 await activePairing.sock.logout();
             } else if (activePairing.sock && activePairing.sock.ws && activePairing.sock.ws.readyState !== activePairing.sock.ws.CLOSED) {
