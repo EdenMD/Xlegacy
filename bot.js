@@ -23,7 +23,7 @@ const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASS = process.env.MEGA_PASS;
 
 // Bot Version for welcome message
-const BOT_VERSION = "King-MD Session Bot v1.2.0 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
+const BOT_VERSION = "King-MD Session Bot v1.2.1 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
 
 // --- Initialize Telegram Bot ---
 if (!TELEGRAM_BOT_TOKEN) {
@@ -346,19 +346,36 @@ ______________________________
                 return; 
             }
 
+            // ⭐ FIX: Save QR buffer to a temporary file, send it, then delete it.
             if (qr && currentPairing.method === 'qr' && !sock.authState.creds.registered) {
                 const now = new Date();
                 const timeSinceLastSent = currentPairing.lastPairingInfoSent ? (now.getTime() - currentPairing.lastPairingInfoSent.timestamp.getTime()) / 1000 : Infinity;
 
                 if (!currentPairing.lastPairingInfoSent || (currentPairing.lastPairingInfoSent.type === 'qr' && currentPairing.lastPairingInfoSent.value !== qr) || timeSinceLastSent > 30) {
-                    await telegramBot.sendMessage(chatId, "📸 Please scan this QR code with your WhatsApp app:", { parse_mode: 'Markdown' });
-                    await telegramBot.sendPhoto(chatId, Buffer.from(qr.split(',')[1], 'base64'), { 
-                        caption: "WhatsApp QR Code (expires in 60 seconds)",
-                        filename: 'whatsapp_qr.png', 
-                        contentType: 'image/png'     
-                    });
-                    await telegramBot.sendMessage(chatId, "_If this QR code expires or you're having trouble scanning, a new one will be sent if the connection permits._", { parse_mode: 'Markdown' });
-                    currentPairing.lastPairingInfoSent = { type: 'qr', value: qr, timestamp: new Date() };
+                    const qrBuffer = Buffer.from(qr.split(',')[1], 'base64');
+                    // Ensure the sessionPath exists before creating the temp file inside it
+                    if (!fs.existsSync(sessionPath)) {
+                        fs.mkdirSync(sessionPath, { recursive: true });
+                    }
+                    const tempQrPath = `${sessionPath}/qr_code_${Date.now()}.png`;
+
+                    try {
+                        fs.writeFileSync(tempQrPath, qrBuffer);
+
+                        await telegramBot.sendMessage(chatId, "📸 Please scan this QR code with your WhatsApp app:", { parse_mode: 'Markdown' });
+                        await telegramBot.sendPhoto(chatId, tempQrPath, { // Send local file path
+                            caption: "WhatsApp QR Code (expires in 60 seconds)"
+                        });
+                        await telegramBot.sendMessage(chatId, "_If this QR code expires or you're having trouble scanning, a new one will be sent if the connection permits._", { parse_mode: 'Markdown' });
+                        currentPairing.lastPairingInfoSent = { type: 'qr', value: qr, timestamp: new Date() };
+                    } catch (fileError) {
+                        logger.error(`Error handling QR code for chat ${chatId}: ${fileError.message}`);
+                        await telegramBot.sendMessage(chatId, "❌ Error generating/sending QR code. Please try again.", { parse_mode: 'Markdown' });
+                    } finally {
+                        if (fs.existsSync(tempQrPath)) {
+                            fs.unlinkSync(tempQrPath); // Clean up the temporary QR file
+                        }
+                    }
                 }
             }
         });

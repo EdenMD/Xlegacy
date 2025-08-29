@@ -1,19 +1,19 @@
 {
-  "name": "xlegacy-telegram-bot",
+  "name": "xlegacy-bot",
   "version": "1.0.0",
-  "description": "Telegram Bot to generate King-MD WhatsApp session IDs using @whiskeysockets/baileys.",
+  "description": "Telegram Bot for King-MD Session ID Generation",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
-  "keywords": ["telegram", "whatsapp", "bot", "baileys", "session-id", "king-md"],
+  "keywords": [],
   "author": "Xlegacy",
   "license": "ISC",
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.2",
     "megajs": "^1.1.2",
-    "node-telegram-bot-api": "^0.65.1",
+    "node-telegram-bot-api": "^0.66.0", <-- Updated version
     "pino": "^9.0.0",
     "uuid": "^9.0.1"
   }
