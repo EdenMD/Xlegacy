@@ -1,0 +1,14 @@
+# Node.js
+node_modules/
+.env
+
+# Baileys session files
+temp_sessions/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS generated files
+.DS_Store
+.vscode/
