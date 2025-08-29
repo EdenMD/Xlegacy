@@ -23,7 +23,7 @@ const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASS = process.env.MEGA_PASS;
 
 // Bot Version for welcome message
-const BOT_VERSION = "King-MD Session Bot v1.2.3 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
+const BOT_VERSION = "King-MD Session Bot v1.2.4 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
 const MAX_RECONNECT_ATTEMPTS = 5; // ⭐ NEW: Max reconnect attempts for transient disconnects
 
 // --- Initialize Telegram Bot ---
@@ -182,14 +182,12 @@ async function startPairing(chatId, num, method = 'code', isReconnect = false) {
             connectTimeoutMs: 60000
         });
 
-        // ⭐ UPDATED: Initialize reconnectAttempts
         if (!isReconnect) {
             activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null, reconnectAttempts: 0 });
         } else {
             const existingEntry = activePairings.get(chatId);
             if (existingEntry) {
                 existingEntry.sock = sock;
-                // Preserve existing reconnectAttempts count
                 activePairings.set(chatId, existingEntry);
             } else {
                 logger.error(`Logic error: isReconnect true but no active pairing found for chat ${chatId}. Treating as new.`);
@@ -347,7 +345,6 @@ ______________________________
                         messageToUser += `Reason: _Persistent temporary connection issue (Status ${statusCode || 'Unknown'} - ${reasonText}). Max reconnection attempts reached._\n`;
                         messageToUser += `Please try pairing again with \`${currentPairing.method === 'qr' ? '/qr' : '/code <number>'}\` for a fresh session.`;
                         await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
-                        // Clean up and delete active pairing on persistent transient disconnect
                         await sock.logout(); // Explicit logout to ensure Baileys cleans up internally
                         removeFile(sessionPath);
                         activePairings.delete(chatId);
@@ -360,37 +357,26 @@ ______________________________
                 return; 
             }
 
-            // ⭐ FIX: Save QR buffer to a temporary file, send it, then delete it.
+            // ⭐ FIX: Send QR buffer directly with explicit filename and contentType
             if (qr && currentPairing.method === 'qr' && !sock.authState.creds.registered) {
                 const now = new Date();
                 const timeSinceLastSent = currentPairing.lastPairingInfoSent ? (now.getTime() - currentPairing.lastPairingInfoSent.timestamp.getTime()) / 1000 : Infinity;
 
                 if (!currentPairing.lastPairingInfoSent || (currentPairing.lastPairingInfoSent.type === 'qr' && currentPairing.lastPairingInfoSent.value !== qr) || timeSinceLastSent > 30) {
                     const qrBuffer = Buffer.from(qr.split(',')[1], 'base64');
-                    // Ensure the sessionPath exists before creating the temp file inside it
-                    if (!fs.existsSync(sessionPath)) {
-                        fs.mkdirSync(sessionPath, { recursive: true });
-                    }
-                    const tempQrPath = `${sessionPath}/qr_code_${Date.now()}.png`;
 
                     try {
-                        fs.writeFileSync(tempQrPath, qrBuffer);
-
                         await telegramBot.sendMessage(chatId, "📸 Please scan this QR code with your WhatsApp app:", { parse_mode: 'Markdown' });
-                        await telegramBot.sendPhoto(chatId, tempQrPath, { // Send local file path
+                        await telegramBot.sendPhoto(chatId, qrBuffer, { // ⭐ Send Buffer directly
                             caption: "WhatsApp QR Code (expires in 60 seconds)",
-                            filename: 'whatsapp_qr.png', // ⭐ RE-ADDED: Explicit filename
-                            contentType: 'image/png'     // ⭐ RE-ADDED: Explicit content type
+                            filename: 'whatsapp_qr.png', // Explicit filename
+                            contentType: 'image/png'     // Explicit content type
                         });
                         await telegramBot.sendMessage(chatId, "_If this QR code expires or you're having trouble scanning, a new one will be sent if the connection permits._", { parse_mode: 'Markdown' });
                         currentPairing.lastPairingInfoSent = { type: 'qr', value: qr, timestamp: new Date() };
-                    } catch (fileError) {
-                        logger.error(`Error handling QR code for chat ${chatId}: ${fileError.message}`);
-                        await telegramBot.sendMessage(chatId, "❌ Error generating/sending QR code. Please try again.", { parse_mode: 'Markdown' });
-                    } finally {
-                        if (fs.existsSync(tempQrPath)) {
-                            fs.unlinkSync(tempQrPath); // Clean up the temporary QR file
-                        }
+                    } catch (sendPhotoError) {
+                        logger.error(`Error sending QR code to Telegram for chat ${chatId}: ${sendPhotoError.message}`);
+                        await telegramBot.sendMessage(chatId, "❌ Error sending QR code to Telegram. Please try again.", { parse_mode: 'Markdown' });
                     }
                 }
             }
