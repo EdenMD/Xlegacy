@@ -1,7 +1,9 @@
 name: Run Xlegacy Telegram Bot
 
 on:
-  # This workflow can be triggered manually from the GitHub Actions tab
+  push:
+    branches:
+      - main # Or your default branch (e.g., master)
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -13,9 +15,8 @@ jobs:
   run_telegram_bot:
     runs-on: ubuntu-latest # Use the latest Ubuntu Linux runner
     
-    # Set a timeout for the entire job.
-    # The bot will run for this duration and then the job will be cancelled.
-    timeout-minutes: ${{ github.event.inputs.duration_minutes || 60 }} 
+    # Set a timeout for the entire job. Convert input string to integer.
+    timeout-minutes: ${{ fromJson(github.event.inputs.duration_minutes || '60') }} 
 
     steps:
     - name: Checkout repository
@@ -27,9 +28,6 @@ jobs:
         node-version: '20' # Recommend using Node.js 20 for modern applications
 
     - name: Install dependencies
-      # This assumes you have a package.json file with all your dependencies listed.
-      # If not, 'npm install' might not install all modules, relying on ensureModule.
-      # It's highly recommended to have a package.json.
       run: npm install
 
     - name: Run Telegram Bot
@@ -41,7 +39,6 @@ jobs:
       run: node bot.js # Command to start your bot script
       
     - name: Display end message (if job completes before timeout)
-      # This step will only run if the 'node bot.js' command exits naturally.
-      # If the job times out, this step won't be reached.
-      if: success() || failure()
+      # This step will run regardless of the success or failure of previous steps.
+      if: always()
       run: echo "Bot job completed or timed out after the specified duration."
