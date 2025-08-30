@@ -1,12 +1,4 @@
 const TelegramBot = require('node-telegram-bot-api');
-const makeWASocket = require('@whiskeysockets/baileys').default; // Using @whiskeysockets/baileys
-const {
-    useMultiFileAuthState,
-    delay,
-    makeCacheableSignalKeyStore,
-    DisconnectReason,
-    fetchLatestBaileysVersion // NEW: For fetching latest version
-} = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const fs = require('fs');
 const { Storage } = require("megajs");
@@ -15,16 +7,17 @@ const { execSync } = require('child_process');
 const { Boom } = require('@hapi/boom');
 
 // --- Configuration ---
-// Telegram Bot Token (from environment variables)
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-
-// Mega.nz credentials (from environment variables)
 const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASS = process.env.MEGA_PASS;
 
 // Bot Version for welcome message
-const BOT_VERSION = "King-MD Session Bot v1.2.5 (WhiskeyBaileys)"; // ⭐ UPDATED: Bot Version
-const MAX_RECONNECT_ATTEMPTS = 5; // ⭐ Max reconnect attempts for transient disconnects
+const BOT_VERSION = "Edentech Support Bot v1.0.0";
+
+// Path for storing uploaded file metadata (acting as a simple database)
+const UPLOADS_DB_PATH = './data/uploads_db.json';
+// Path for temporary file downloads
+const TEMP_DOWNLOAD_DIR = './temp_downloads';
 
 // --- Initialize Telegram Bot ---
 if (!TELEGRAM_BOT_TOKEN) {
@@ -33,11 +26,8 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 const telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// Increased logging level to 'info' for better debugging visibility
+// Logger for better debugging visibility
 const logger = pino({ level: "info" }).child({ level: "info" });
-
-// Ensure EventEmitter defaultMaxListeners is increased
-require('events').EventEmitter.defaultMaxListeners = 500;
 
 // ⭐ NEW: Verify Telegram Bot Token immediately on startup
 (async () => {
@@ -49,7 +39,6 @@ require('events').EventEmitter.defaultMaxListeners = 500;
         process.exit(1);
     }
 })();
-
 
 // Function to ensure a module is installed
 function ensureModule(moduleName) {
@@ -69,477 +58,387 @@ function ensureModule(moduleName) {
 
 // Ensure all required modules are installed
 ensureModule('node-telegram-bot-api');
-ensureModule('@whiskeysockets/baileys'); // Ensure "@whiskeysockets/baileys" is checked
 ensureModule('pino');
 ensureModule('megajs');
 ensureModule('uuid');
 ensureModule('@hapi/boom');
 
-// Function to generate a unique ID
-function kingid() {
-    return uuidv4();
+// Ensure necessary directories exist
+if (!fs.existsSync('./data')) {
+    fs.mkdirSync('./data');
+}
+if (!fs.existsSync(TEMP_DOWNLOAD_DIR)) {
+    fs.mkdirSync(TEMP_DOWNLOAD_DIR);
 }
 
-// Function to generate a random Mega ID (for filename)
-function randomMegaId(length = 6, numberLength = 4) {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += characters.charAt(Math.floor(Math.random() * characters.length));
-    }
-    const number = Math.floor(Math.random() * Math.pow(10, numberLength));
-    return `${result}${number}`;
-}
 
-// Function to upload credentials to Mega
-async function uploadCredsToMega(credsPath) {
+// --- Mega.nz Integration for File Uploads ---
+let megaStorage = null;
+
+async function initMegaStorage() {
     if (!MEGA_EMAIL || !MEGA_PASS) {
-        throw new Error("Mega.nz credentials are not set. Skipping upload. Please set MEGA_EMAIL and MEGA_PASS environment variables.");
+        logger.warn("Mega.nz credentials are not set. File upload/download features will be disabled. Please set MEGA_EMAIL and MEGA_PASS environment variables.");
+        return;
     }
-
     try {
-        const storage = await new Storage({
+        megaStorage = await new Storage({
             email: MEGA_EMAIL,
             password: MEGA_PASS
         }).ready;
-        logger.info('Mega storage initialized.');
+        logger.info('Mega storage initialized successfully.');
+    } catch (error) {
+        logger.error('Error initializing Mega storage. File upload/download features will be disabled:', error.message);
+        megaStorage = null; // Ensure it's null if initialization fails
+    }
+}
+initMegaStorage(); // Initialize Mega on startup
 
-        if (!fs.existsSync(credsPath)) {
-            throw new Error(`File not found: ${credsPath}`);
+// Function to upload a file to Mega
+async function uploadFileToMega(filePath, originalFileName) {
+    if (!megaStorage) {
+        throw new Error("Mega.nz storage is not initialized or credentials are missing.");
+    }
+
+    try {
+        if (!fs.existsSync(filePath)) {
+            throw new Error(`File not found for upload: ${filePath}`);
         }
 
-        const fileSize = fs.statSync(credsPath).size;
-        const uploadResult = await storage.upload({
-            name: `${randomMegaId()}.json`,
-            size: fileSize
-        }, fs.createReadStream(credsPath)).complete;
+        const fileSize = fs.statSync(filePath).size;
+        const megaFileName = `${uuidv4()}_${originalFileName}`; // Unique name on Mega
+        
+        logger.info(`Uploading ${originalFileName} (${fileSize} bytes) to Mega as ${megaFileName}...`);
 
-        logger.info('Session successfully uploaded to Mega.');
-        const fileNode = storage.files[uploadResult.nodeId];
+        const uploadResult = await megaStorage.upload({
+            name: megaFileName,
+            size: fileSize
+        }, fs.createReadStream(filePath)).complete;
+
+        const fileNode = megaStorage.files[uploadResult.nodeId];
         const megaUrl = await fileNode.link();
-        logger.info(`Session Url: ${megaUrl}`);
-        return megaUrl;
+        
+        logger.info(`File "${originalFileName}" successfully uploaded to Mega. URL: ${megaUrl}`);
+        return { megaFileName, megaUrl };
     } catch (error) {
-        logger.error('Error uploading to Mega:', error);
+        logger.error(`Error uploading "${originalFileName}" to Mega:`, error);
         throw error;
     }
 }
 
-// Function to remove a file/directory
+// Function to remove a local file/directory
 function removeFile(FilePath) {
     if (!fs.existsSync(FilePath)) return false;
     fs.rmSync(FilePath, { recursive: true, force: true });
-    logger.info(`Removed: ${FilePath}`);
+    logger.info(`Removed local file/dir: ${FilePath}`);
     return true;
 }
 
-// Global variable to store active pairing processes by chat ID
-// Will store { sock: BaileysInstance, sessionPath: string, isCancelling: boolean, method: 'code'|'qr', lastPairingInfoSent: { type: 'qr' | 'code' | 'session_id', value: string, timestamp: Date } | null, reconnectAttempts: number }
-const activePairings = new Map();
+// --- User Uploads Database (simple JSON file) ---
+let userUploadsDB = {}; // { chatId: [{ file_id: string, originalName: string, megaFileName: string, megaUrl: string, uploadDate: string }] }
 
-async function startPairing(chatId, num, method = 'code', isReconnect = false) {
-    if (activePairings.has(chatId) && !isReconnect) {
-        await telegramBot.sendMessage(chatId, "🚫 A pairing process is already active for this chat. Please wait for it to complete or use /cancel to stop it.", { parse_mode: 'Markdown' });
-        return;
-    }
-
-    const id = uuidv4(); // Generate unique ID for this session
-    let sessionPath = `./temp_sessions/${id}`; // Use a dedicated temp folder
-
-    if (!fs.existsSync('./temp_sessions')) {
-        fs.mkdirSync('./temp_sessions');
-    }
-
-    if (!isReconnect) {
-        removeFile(sessionPath);
-    } else {
-        const existingEntry = activePairings.get(chatId);
-        if (existingEntry && existingEntry.sessionPath) {
-            sessionPath = existingEntry.sessionPath; // Use the existing session path
-            logger.info(`Reconnecting using existing session path: ${sessionPath} for chat ${chatId}`);
-        } else {
-            logger.error(`Logic error: isReconnect true but no existing sessionPath found for chat ${chatId}. Treating as new.`);
-            removeFile(sessionPath);
-        }
-    }
-    
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const { version } = await fetchLatestBaileysVersion();
-
-    let sock;
-    let currentPairingInMainScope;
-
-    try {
-        sock = makeWASocket({
-            version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger),
-            },
-            printQRInTerminal: false,
-            logger: logger,
-            browser: ['Ubuntu', 'Chrome', '121.0.6167.85'], 
-            connectTimeoutMs: 60000
-        });
-
-        if (!isReconnect) {
-            activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null, reconnectAttempts: 0 });
-        } else {
-            const existingEntry = activePairings.get(chatId);
-            if (existingEntry) {
-                existingEntry.sock = sock;
-                activePairings.set(chatId, existingEntry);
-            } else {
-                logger.error(`Logic error: isReconnect true but no active pairing found for chat ${chatId}. Treating as new.`);
-                activePairings.set(chatId, { sock: sock, sessionPath: sessionPath, isCancelling: false, method: method, lastPairingInfoSent: null, reconnectAttempts: 0 });
-            }
-        }
-
-        currentPairingInMainScope = activePairings.get(chatId);
-        if (!currentPairingInMainScope) {
-            throw new Error("Internal error: Could not retrieve active pairing info after initialization.");
-        }
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on("connection.update", async (s) => {
-            let connection = null;
-            let lastDisconnect = null;
-            let qr = null;
-
-            if (s && typeof s === 'object') {
-                connection = s.connection;
-                lastDisconnect = s.lastDisconnect;
-                qr = s.qr;
-            } else {
-                logger.error(`Connection update received invalid payload (not an object): ${JSON.stringify(s)} for chat ${chatId}`);
-                if (sock && sock.ws && sock.ws.readyState !== sock.ws.CLOSED && sock.ws.readyState !== sock.ws.CLOSING) {
-                    try { await sock.ws.close(); } catch (e) { logger.error(`Error closing sock ws during invalid update for chat ${chatId}: ${e.message}`); }
-                }
-                return;
-            }
-
-            const currentPairing = activePairings.get(chatId);
-            if (!currentPairing || currentPairing.isCancelling) {
-                logger.info(`Connection update ignored for chat ${chatId} due to cancellation or no active pairing.`);
-                if (sock && sock.ws && sock.ws.readyState !== sock.ws.CLOSED && sock.ws.readyState !== sock.ws.CLOSING) {
-                    try { await sock.ws.close(); } catch (e) { logger.error(`Error closing sock ws during ignored update for chat ${chatId}: ${e.message}`); }
-                }
-                return;
-            }
-
-            if (connection === "connecting") {
-                await telegramBot.sendMessage(chatId, "🔄 WhatsApp connection status: *Connecting...* Please wait.", { parse_mode: 'Markdown' });
-            } else if (connection === "open") {
-                currentPairing.reconnectAttempts = 0; // Reset attempts on successful connection
-                await telegramBot.sendMessage(chatId, "✅ WhatsApp connection status: *Connected!* Your device is now linked.", { parse_mode: 'Markdown' });
-                logger.info(`WhatsApp connection opened successfully for chat ${chatId}.`);
-
-                if (sock.authState.creds.registered && !currentPairing.lastPairingInfoSent) {
-                    await delay(5000); 
-
-                    const filePath = `${sessionPath}/creds.json`; 
-
-                    if (!fs.existsSync(filePath)) {
-                        logger.error(`File not found: ${filePath} for chat ${chatId}`);
-                        await telegramBot.sendMessage(chatId, "❌ Error: Session credentials file (creds.json) not found after connection open. This might indicate an issue. Please try `/code <number>` or `/qr` again.", { parse_mode: 'Markdown' });
-                        await sock.logout(); 
-                        removeFile(sessionPath);
-                        activePairings.delete(chatId);
-                        return;
-                    }
-
-                    try {
-                        const megaUrl = await uploadCredsToMega(filePath);
-                        const sid = megaUrl.includes("https://mega.nz/file/")
-                            ? 'King~' + megaUrl.split("https://mega.nz/file/")[1]
-                            : 'Error: Invalid Mega URL after upload';
-
-                        logger.info(`Generated Session ID for chat ${chatId}: ${sid}`);
-
-                        const KING_TEXT = `
-*✅ SESSION ID GENERATED SUCCESSFULLY! ✅*
-______________________________
-╔════◇
-║ 『 𝐘𝐎𝐔'𝐕𝐄 𝐂𝐇𝐎𝐒𝐄𝐍 𝐊𝐈𝐍𝐆 𝐌𝐃 』
-╚══════════════╝
-╔═════◇
-║ 『••• 𝗩𝗶𝘀𝗶𝘁 𝗙𝗼𝗿 𝗛𝐞𝐥𝐩 •••』
-║❒ 𝐓𝐮𝐭𝐨𝐫𝐢𝐚𝐥: _[Your King-MD YouTube/Tutorial Link Here]_
-║❒ 𝐎𝐰𝐧𝐞𝐫: _[Your Owner Contact Link Here]_
-║❒ 𝐑𝐞𝐩𝐨: _[Your King-MD Repo Link Here]_
-║❒ 𝐖𝐚𝐂𝐡𝐚𝐧𝐧𝐞𝐥: _[Your King-MD WhatsApp Channel Here]_
-║ 💜💜💜
-╚══════════════╝
- 𝗞𝗜𝗡𝗚-𝗠𝗗 𝗩𝗘𝗥𝗦𝗜𝗢. 5.0.0
-______________________________
-
-🎉 Use your Session ID above to Deploy your King-MD Bot!`;
-
-                        await telegramBot.sendMessage(chatId, `Your new Session ID is:\n\`\`\`\n${sid}\n\`\`\`\n${KING_TEXT}`, { parse_mode: 'Markdown' });
-
-                        logger.info(`Session ID sent to Telegram for chat ${chatId}.`);
-                        currentPairing.lastPairingInfoSent = { type: 'session_id', value: sid, timestamp: new Date() }; 
-                    } catch (uploadError) {
-                        logger.error(`Failed to upload session to Mega.nz for chat ${chatId}:`, uploadError.message);
-                        await telegramBot.sendMessage(chatId, `❌ Failed to upload session to Mega.nz. Error: ${uploadError.message}. Please try again.`, { parse_mode: 'Markdown' });
-                    } finally {
-                        await delay(100);
-                        await sock.logout(); 
-                        removeFile(sessionPath);
-                        if (activePairings.has(chatId)) {
-                            activePairings.delete(chatId); 
-                        }
-                    }
-                } else if (!sock.authState.creds.registered && currentPairing.lastPairingInfoSent) {
-                    const now = new Date();
-                    const lastSentTime = currentPairing.lastPairingInfoSent.timestamp;
-                    const timeSinceLastSent = (now.getTime() - lastSentTime.getTime()) / 1000; 
-
-                    if (timeSinceLastSent > 30) { 
-                        await telegramBot.sendMessage(chatId, "🔄 Reconnected! Your previous QR/code might have expired. Please wait, I'm trying to get new pairing information.", { parse_mode: 'Markdown' });
-                        currentPairing.lastPairingInfoSent = null; 
-                    } else {
-                         await telegramBot.sendMessage(chatId, "🔄 Reconnected! Please continue with the previously sent pairing information.", { parse_mode: 'Markdown' });
-                    }
-                }
-                
-                if (sock.authState.creds.registered && currentPairing.lastPairingInfoSent && currentPairing.lastPairingInfoSent.type === 'session_id') {
-                    logger.info(`Chat ${chatId}: Reconnected but session ID already delivered. Cleaning up.`);
-                    await sock.logout();
-                    removeFile(sessionPath);
-                    activePairings.delete(chatId);
-                }
-                return;
-            } else if (connection === "close") {
-                let messageToUser = "❌ WhatsApp connection status: *Closed*.\n";
-
-                const boomError = new Boom(lastDisconnect?.error);
-                const statusCode = boomError?.output?.statusCode;
-                const reasonText = lastDisconnect?.error?.reason || 'No specific reason provided';
-                const isErrorEmpty = Object.keys(lastDisconnect?.error || {}).length === 0;
-
-                const isPermanentDisconnect = statusCode === DisconnectReason.loggedOut || (statusCode === DisconnectReason.badSession && !isErrorEmpty) || statusCode === 401;
-
-                if (currentPairing.isCancelling) {
-                    logger.info(`Connection for chat ${chatId} closed due to explicit cancellation.`);
-                    await telegramBot.sendMessage(chatId, "✅ The pairing process has been cancelled.", { parse_mode: 'Markdown' });
-                    removeFile(sessionPath);
-                    activePairings.delete(chatId);
-                    return;
-                }
-                else if (isPermanentDisconnect) {
-                    messageToUser += `Reason: _Permanent session issue - Logged Out (Status ${statusCode}). This means your WhatsApp session on the phone was either closed, or you linked another device. Please try pairing again with \`${currentPairing.method === 'qr' ? '/qr' : '/code <number>'}\` for a fresh session._\n`;
-                    await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
-                    logger.warn(`Permanent disconnect for chat ${chatId}. Full disconnect object:`, lastDisconnect);
-                    removeFile(sessionPath);
-                    activePairings.delete(chatId);
-                    return; 
-                }
-                else { 
-                    currentPairing.reconnectAttempts++;
-                    logger.warn(`Transient disconnect for chat ${chatId}. Attempt ${currentPairing.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}. Full disconnect object:`, lastDisconnect);
-
-                    if (currentPairing.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                        messageToUser += `Reason: _Persistent temporary connection issue (Status ${statusCode || 'Unknown'} - ${reasonText}). Max reconnection attempts reached._\n`;
-                        messageToUser += `Please try pairing again with \`${currentPairing.method === 'qr' ? '/qr' : '/code <number>'}\` for a fresh session.`;
-                        await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
-                        await sock.logout(); 
-                        removeFile(sessionPath);
-                        activePairings.delete(chatId);
-                    } else {
-                        messageToUser += `Reason: _Temporary connection issue with WhatsApp (Status ${statusCode || 'Unknown'} - ${reasonText}). Attempting to reconnect automatically (Attempt ${currentPairing.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})..._\n`;
-                        await telegramBot.sendMessage(chatId, messageToUser, { parse_mode: 'Markdown' });
-                    }
-                }
-                return; 
-            }
-
-            // ⭐ CRITICAL FIX: Save QR buffer to a temporary file, send its PATH, but include explicit options.
-            if (qr && currentPairing.method === 'qr' && !sock.authState.creds.registered) {
-                const now = new Date();
-                const timeSinceLastSent = currentPairing.lastPairingInfoSent ? (now.getTime() - currentPairing.lastPairingInfoSent.timestamp.getTime()) / 1000 : Infinity;
-
-                if (!currentPairing.lastPairingInfoSent || (currentPairing.lastPairingInfoSent.type === 'qr' && currentPairing.lastPairingInfoSent.value !== qr) || timeSinceLastSent > 30) {
-                    const qrBuffer = Buffer.from(qr.split(',')[1], 'base64');
-                    // Ensure the sessionPath exists before creating the temp file inside it
-                    if (!fs.existsSync(sessionPath)) {
-                        fs.mkdirSync(sessionPath, { recursive: true });
-                    }
-                    const tempQrPath = `${sessionPath}/qr_code_${Date.now()}.png`;
-
-                    try {
-                        fs.writeFileSync(tempQrPath, qrBuffer);
-
-                        await telegramBot.sendMessage(chatId, "📸 Please scan this QR code with your WhatsApp app:", { parse_mode: 'Markdown' });
-                        // ⭐ REFINED: Send local file path with explicit filename and contentType in options.
-                        await telegramBot.sendPhoto(chatId, tempQrPath, { 
-                            caption: "WhatsApp QR Code (expires in 60 seconds)",
-                            filename: 'whatsapp_qr.png', // Explicit filename for robustness
-                            contentType: 'image/png'     // Explicit content type for robustness
-                        });
-                        await telegramBot.sendMessage(chatId, "_If this QR code expires or you're having trouble scanning, a new one will be sent if the connection permits._", { parse_mode: 'Markdown' });
-                        currentPairing.lastPairingInfoSent = { type: 'qr', value: qr, timestamp: new Date() };
-                    } catch (sendPhotoError) {
-                        logger.error(`Error sending QR code to Telegram for chat ${chatId}: ${sendPhotoError.message}`);
-                        await telegramBot.sendMessage(chatId, "❌ Error sending QR code to Telegram. Please try again.", { parse_mode: 'Markdown' });
-                    } finally {
-                        if (fs.existsSync(tempQrPath)) {
-                            fs.unlinkSync(tempQrPath); // Clean up the temporary QR file
-                        }
-                    }
-                }
-            }
-        });
-
-        if (!sock.authState.creds.registered) {
-            if (currentPairingInMainScope.method === 'code') {
-                if (num && num.trim() !== '') {
-                    await telegramBot.sendMessage(chatId, `🚀 Requesting pairing code for number: *${num}*...`, { parse_mode: 'Markdown' });
-                    await delay(1500);
-                    const cleanNum = num.replace(/[^0-9]/g, '');
-                    const code = await sock.requestPairingCode(cleanNum); // ⭐ Using sock.requestPairingCode
-                    if (code) {
-                        await telegramBot.sendMessage(chatId,
-                            `✅ Your 8-digit Pairing Code is:\n\`\`\`${code}\`\`\`\n\n` +
-                            `*Follow these steps on your main WhatsApp mobile app:*\n` +
-                            `1. Open *WhatsApp* on your main phone.\n` +
-                            `2. Go to *Settings* (or three dots menu on Android) -> *Linked Devices*.\n` +
-                            `3. Tap on *Link a Device*.\n` +
-                            `4. If prompted, select *Link with phone number*.\n` +
-                            `5. Enter the \`${code}\` (8-digit) code shown above into your WhatsApp app.\n\n` +
-                            `_Please complete this within 60 seconds as the code may expire._`,
-                            { parse_mode: 'Markdown' });
-                        currentPairingInMainScope.lastPairingInfoSent = { type: 'code', value: code, timestamp: new Date() }; 
-                    } else {
-                        await telegramBot.sendMessage(chatId, "❌ Failed to get a pairing code. This might be due to a temporary WhatsApp server issue, network problem, or an invalid number format. Please ensure your number is correct (e.g., 254712345678) and try again with `/code <number>`.", { parse_mode: 'Markdown' });
-                        await sock.logout(); 
-                        removeFile(sessionPath);
-                        activePairings.delete(chatId);
-                    }
-                } else {
-                    await telegramBot.sendMessage(chatId, "❌ Error: A WhatsApp number is required to request a pairing code. Please use: `/code <Your WhatsApp Number>` (e.g., /code 254712345678)", { parse_mode: 'Markdown' });
-                    await sock.logout(); 
-                    removeFile(sessionPath);
-                    if (activePairings.has(chatId)) {
-                        activePairings.delete(chatId);
-                    }
-                }
-            } else if (currentPairingInMainScope.method === 'qr') { 
-                 await telegramBot.sendMessage(chatId, "🔄 Generating QR code... Please wait a moment for it to appear.", { parse_mode: 'Markdown' });
-            }
-        }
-
-    } catch (err) {
-        logger.error(`An error occurred during pairing process for chat ${chatId}:`, err);
-        await telegramBot.sendMessage(chatId, `❌ An unexpected error occurred during the pairing process: ${err.message}. Please try again with \`${method === 'qr' ? '/qr' : '/code <number>'}\`.`, { parse_mode: 'Markdown' });
-        removeFile(sessionPath);
-        if (activePairings.has(chatId)) {
-            activePairings.delete(chatId);
+function loadUploadsDB() {
+    if (fs.existsSync(UPLOADS_DB_PATH)) {
+        try {
+            userUploadsDB = JSON.parse(fs.readFileSync(UPLOADS_DB_PATH, 'utf8'));
+            logger.info('User uploads database loaded.');
+        } catch (error) {
+            logger.error('Error loading user uploads database, starting fresh:', error.message);
+            userUploadsDB = {};
         }
     }
 }
 
-// Helper to handle the /code command (specific to pairing code)
-async function handleCodeCommand(msg, match) {
-    const chatId = msg.chat.id;
-    const whatsappNumber = match && match[1] ? match[1].trim() : '';
-
-    if (!whatsappNumber || whatsappNumber === '') {
-        await telegramBot.sendMessage(chatId, "🚫 The `/code` command requires your WhatsApp number (with country code). Example: `/code 254712345678`", { parse_mode: 'Markdown' });
-        return;
-    }
-
-    await telegramBot.sendMessage(chatId, `✨ Initiating WhatsApp pairing for *${whatsappNumber}* using the pairing code method. Please stand by...`, { parse_mode: 'Markdown' });
-    startPairing(chatId, whatsappNumber, 'code', false); 
+function saveUploadsDB() {
+    fs.writeFileSync(UPLOADS_DB_PATH, JSON.stringify(userUploadsDB, null, 2), 'utf8');
+    logger.info('User uploads database saved.');
 }
 
-// ⭐ NEW: Helper to handle the /qr command
-async function handleQrCommand(msg) {
-    const chatId = msg.chat.id;
-    await telegramBot.sendMessage(chatId, `✨ Initiating WhatsApp pairing using the QR code method. Please stand by...`, { parse_mode: 'Markdown' });
-    startPairing(chatId, null, 'qr', false); 
-}
+loadUploadsDB(); // Load database on startup
+
+// Global variable to track users expecting a file upload
+const expectingFileUpload = new Map(); // Map: chatId -> true/false
 
 
-// Command for /start - Provides comprehensive help, updated for both methods
+// --- Edentech Information Content ---
+const EDENTECH_ABOUT = `
+*🌟 About Eden Technology (Edentech) 🌟*
+
+Edentech is a cutting-edge technology company dedicated to innovating and building robust software solutions for a connected world. We believe in harnessing the power of technology to create intuitive, efficient, and impactful products that enhance daily life and empower businesses. Our focus is on delivering high-quality, user-centric experiences across various platforms.
+`;
+
+const EDENTECH_FOUNDER = `
+*👤 The Founder of Eden Technology 👤*
+
+Eden Technology was founded by *Nyasha Munyanyiwa*, a visionary 16-year-old boy from Bulawayo, Zimbabwe. In 2025, with a passion to make the world a better place, Nyasha embarked on this journey. He lives with his mother, father, and sister, and successfully completed his O-levels in 2024, demonstrating his early commitment to education and innovation.
+`;
+
+const EDENTECH_ORIGIN = `
+*🌱 The Origin Story of Eden Technology 🌱*
+
+Edentech was born in *2025* out of a desire to bridge the gap between complex technological concepts and user-friendly applications. Nyasha Munyanyiwa envisioned a company that could not only develop powerful tools but also make them accessible and enjoyable for everyone. The journey began with a relentless pursuit of solving real-world problems through elegant code and thoughtful design, leading to the creation of foundational projects that would set the stage for Edentech's future.
+`;
+
+const EDENTECH_PROJECTS = `
+*🚀 Our Flagship Projects 🚀*
+
+Edentech prides itself on a diverse portfolio of innovative projects that demonstrate our commitment to excellence:
+
+1.  *Xbuilder*: Our underlying system and development framework, powering many of our applications.
+2.  *edenX APK*: A flagship mobile application designed for seamless user experience.
+3.  *X-Player*: An advanced music player application with rich features.
+4.  *Xlearners*: A dedicated platform for educational content and e-learning.
+5.  *King-MD Session Bot*: (The predecessor to *this* bot!) A testament to our capabilities in bot development.
+
+...and many other cutting-edge solutions across various domains. We are continuously exploring new frontiers in AI, blockchain, and cloud computing to bring even more transformative products to life!
+`;
+
+const EDENTECH_PROGRESS = `
+*📈 Edentech's Progress & Future 📈*
+
+Edentech is on a relentless path of growth and innovation. We are constantly updating our existing projects, exploring new technologies, and expanding our team to tackle bigger challenges.
+
+*Recent Highlights:*
+*   Successful deployment of edenX APK v2.0 with enhanced performance.
+*   Integration of AI-driven features into Xlearners for personalized learning.
+*   Ongoing research into decentralized applications powered by blockchain.
+
+Stay tuned for more exciting updates and groundbreaking releases from Eden Technology!
+`;
+
+const EDENTECH_CONTACT = `
+*📞 Contact Eden Technology 📞*
+
+Have questions, feedback, or need support? We'd love to hear from you!
+
+*Email:* techn2533@gmail.com
+*Website:* [incredible-bee.static.domains](https://incredible-bee.static.domains/)
+*WhatsApp Channel:* [Edentech Official](https://whatsapp.com/channel/0029VafLsm9IN9irghbQ560v)
+*Phone Number:* +263716676259
+`;
+
+// --- Telegram Bot Commands ---
+
+// Command: /start - Welcome message and menu
 telegramBot.onText(/\/start/, (msg) => {
-    const helpMessage = `
-👋 *Hello there! I'm your King-MD Session ID Generator bot!*
+    const welcomeMessage = `
+👋 *Welcome to the Eden Technology (Edentech) Support Bot!*
 
 ${BOT_VERSION}
 
-I can help you get a *King-MD Session ID* to deploy your WhatsApp bot seamlessly. You can choose between the secure 8-digit pairing code method or scanning a QR code.
+I'm here to provide you with information about Edentech, our projects, and assist you with file uploads.
 
-*Here's how to get your session ID:*
+*Here are the commands you can use:*
 
-*1. Using Pairing Code (Recommended):*
-   Send me your WhatsApp number (with country code) using this command:
-   \`\`\`/code <Your WhatsApp Number>\`\`\`
-   _Example: \`/code 254712345678\`_
-   I will then provide you with an 8-digit code to enter into your WhatsApp app.
+*📚 Information:*
+   /about - Learn what Edentech is.
+   /founder - Discover who founded Edentech.
+   /origin - Understand our origin story.
+   /projects - See our ongoing projects.
+   /progress - Get updates on our advancements.
+   /contact - Find out how to reach us.
 
-*2. Using QR Code (Alternative):*
-   Use this command to receive a QR code:
-   \`\`\`/qr\`\`\`
-   I will send you a QR code that you can scan with your WhatsApp mobile app.
+*📤 File Management:*
+   /upload - Send me a file to securely upload to Mega.nz.
+   /myuploads - View the files you've uploaded.
 
-*Need to stop an ongoing pairing?*
-   \`\`\`/cancel\`\`\`
-   This will immediately stop any active pairing process for your current chat and clean up temporary files.
-
-*⚠️ Important Notes:*
-   - Ensure your WhatsApp number is correct and includes the country code (e.g., 2547...).
-   - You need to complete the pairing steps within 60 seconds as the code/QR expires quickly.
-   - For me to function, these environment variables *must* be set:
-     - \`TELEGRAM_BOT_TOKEN\` (your bot's token)
-     - \`MEGA_EMAIL\` (for uploading session credentials securely)
-     - \`MEGA_PASS\` (for uploading session credentials securely)
-
-Choose your preferred method above to begin your journey with King-MD! Let's get started! 🚀
+*❓ Help:*
+   /help - Show this command menu again.
 `;
-    telegramBot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'Markdown' });
+    telegramBot.sendMessage(msg.chat.id, welcomeMessage, { parse_mode: 'Markdown' });
+});
+
+// Command: /help - Shows the same menu as /start
+telegramBot.onText(/\/help/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, `Here are the commands you can use:\n\n` +
+        `*📚 Information:*\n` +
+        `   /about - Learn what Edentech is.\n` +
+        `   /founder - Discover who founded Edentech.\n` +
+        `   /origin - Understand our origin story.\n` +
+        `   /projects - See our ongoing projects.\n` +
+        `   /progress - Get updates on our advancements.\n` +
+        `   /contact - Find out how to reach us.\n\n` +
+        `*📤 File Management:*\n` +
+        `   /upload - Send me a file to securely upload to Mega.nz.\n` +
+        `   /myuploads - View the files you've uploaded.\n\n` +
+        `*❓ Help:*\n` +
+        `   /help - Show this command menu again.`, { parse_mode: 'Markdown' });
 });
 
 
-// Command for /code <number>
-telegramBot.onText(/\/code (.+)/, async (msg, match) => {
-    await handleCodeCommand(msg, match);
+// Command: /about
+telegramBot.onText(/\/about/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_ABOUT, { parse_mode: 'Markdown' });
 });
 
-// ⭐ NEW: Command for /qr
-telegramBot.onText(/\/qr/, async (msg) => {
-    await handleQrCommand(msg);
+// Command: /founder
+telegramBot.onText(/\/founder/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_FOUNDER, { parse_mode: 'Markdown' });
 });
 
-// Command for /cancel (remains mostly the same, ensuring robust cleanup)
-telegramBot.onText(/\/cancel/, async (msg) => {
+// Command: /origin
+telegramBot.onText(/\/origin/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_ORIGIN, { parse_mode: 'Markdown' });
+});
+
+// Command: /projects
+telegramBot.onText(/\/projects/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_PROJECTS, { parse_mode: 'Markdown' });
+});
+
+// Command: /progress
+telegramBot.onText(/\/progress/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_PROGRESS, { parse_mode: 'Markdown' });
+});
+
+// Command: /contact
+telegramBot.onText(/\/contact/, (msg) => {
+    telegramBot.sendMessage(msg.chat.id, EDENTECH_CONTACT, { parse_mode: 'Markdown', disable_web_page_preview: true });
+});
+
+// Command: /upload - Prepare for file upload
+telegramBot.onText(/\/upload/, async (msg) => {
     const chatId = msg.chat.id;
-    const activePairing = activePairings.get(chatId);
+    if (!megaStorage) {
+        await telegramBot.sendMessage(chatId, "⚠️ Mega.nz integration is not active. Please ensure `MEGA_EMAIL` and `MEGA_PASS` are set in environment variables to use file upload features.", { parse_mode: 'Markdown' });
+        return;
+    }
+    await telegramBot.sendMessage(chatId, "Please send me the file you want to upload. It can be a document, photo, video, or any other file type.");
+    expectingFileUpload.set(chatId, true); // Mark this user as expecting a file
+});
 
-    if (activePairing) {
-        await telegramBot.sendMessage(chatId, "⏳ Attempting to cancel the ongoing pairing process...", { parse_mode: 'Markdown' });
-        activePairing.isCancelling = true;
+// Handle all incoming messages that are files (document, photo, video, audio, voice)
+telegramBot.on('document', handleFileUpload);
+telegramBot.on('photo', handleFileUpload);
+telegramBot.on('video', handleFileUpload);
+telegramBot.on('audio', handleFileUpload);
+telegramBot.on('voice', handleFileUpload);
 
-        try {
-            if (activePairing.sock && activePairing.sock.ws && activePairing.sock.ws.readyState === activePairing.sock.ws.OPEN) {
-                await activePairing.sock.logout();
-            } else if (activePairing.sock && activePairing.sock.ws && activePairing.sock.ws.readyState !== activePairing.sock.ws.CLOSED) {
-                 await activePairing.sock.ws.close();
-            }
-            await delay(100);
-        } catch (error) {
-            logger.warn(`Error during sock instance logout/close for chat ${chatId}:`, error.message);
-        } finally {
-            if (activePairing.sessionPath) {
-                removeFile(activePairing.sessionPath);
-            }
-            activePairings.delete(chatId);
-            await telegramBot.sendMessage(chatId, "✅ The pairing process has been successfully cancelled and temporary files cleaned up.", { parse_mode: 'Markdown' });
-        }
+// Generic file upload handler
+async function handleFileUpload(msg) {
+    const chatId = msg.chat.id;
+
+    if (!expectingFileUpload.has(chatId) || !expectingFileUpload.get(chatId)) {
+        // If not explicitly expecting a file, ignore it or inform the user
+        // We'll just ignore for now to avoid spam
+        return;
+    }
+
+    expectingFileUpload.delete(chatId); // No longer expecting a file from this user
+
+    let fileId, fileName;
+    let fileType = 'document'; // Default
+
+    if (msg.document) {
+        fileId = msg.document.file_id;
+        fileName = msg.document.file_name;
+    } else if (msg.photo) {
+        fileId = msg.photo[msg.photo.length - 1].file_id; // Get the largest photo
+        fileName = `photo_${fileId}.jpg`; // Generate a name for photos
+        fileType = 'photo';
+    } else if (msg.video) {
+        fileId = msg.video.file_id;
+        fileName = msg.video.file_name || `video_${fileId}.mp4`;
+        fileType = 'video';
+    } else if (msg.audio) {
+        fileId = msg.audio.file_id;
+        fileName = msg.audio.file_name || `audio_${fileId}.mp3`;
+        fileType = 'audio';
+    } else if (msg.voice) {
+        fileId = msg.voice.file_id;
+        fileName = `voice_${fileId}.ogg`;
+        fileType = 'voice';
     } else {
-        await telegramBot.sendMessage(chatId, "ℹ️ No active pairing process found for this chat.", { parse_mode: 'Markdown' });
+        await telegramBot.sendMessage(chatId, "I received a file, but I couldn't process its type for upload. Please try a different file.");
+        return;
+    }
+
+    if (!fileName) {
+        fileName = `unknown_file_${fileId}.dat`; // Fallback name
+    }
+
+    const localFilePath = `${TEMP_DOWNLOAD_DIR}/${fileId}_${fileName}`;
+
+    try {
+        await telegramBot.sendMessage(chatId, `⏳ Received your *${fileType}* file: \`${fileName}\`. Downloading and preparing for upload to Mega.nz...`, { parse_mode: 'Markdown' });
+
+        // Download the file from Telegram servers
+        const downloadedPath = await telegramBot.downloadFile(fileId, TEMP_DOWNLOAD_DIR);
+        
+        // Ensure the downloaded path is what we expect or handle filename differences
+        // Telegram sometimes renames files on download. We need the actual path.
+        if (!fs.existsSync(downloadedPath)) {
+            logger.error(`Downloaded file not found at expected path: ${downloadedPath}`);
+            await telegramBot.sendMessage(chatId, "❌ Error downloading file from Telegram. Please try again.");
+            return;
+        }
+
+        const { megaFileName, megaUrl } = await uploadFileToMega(downloadedPath, fileName);
+
+        // Store metadata
+        if (!userUploadsDB[chatId]) {
+            userUploadsDB[chatId] = [];
+        }
+        userUploadsDB[chatId].push({
+            file_id: uuidv4(), // Unique ID for our DB entry
+            originalName: fileName,
+            megaFileName: megaFileName,
+            megaUrl: megaUrl,
+            uploadDate: new Date().toISOString()
+        });
+        saveUploadsDB();
+
+        await telegramBot.sendMessage(chatId,
+            `✅ Your file *"${fileName}"* has been successfully uploaded to Mega.nz!\n` +
+            `You can access it here: [${megaFileName}](${megaUrl})\n\n` +
+            `Use /myuploads to see all your uploaded files.`,
+            { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+
+    } catch (error) {
+        logger.error(`Error processing file upload for chat ${chatId}:`, error);
+        await telegramBot.sendMessage(chatId, `❌ An error occurred during file upload: ${error.message}. Please try again.`);
+    } finally {
+        // Clean up the locally downloaded file
+        if (fs.existsSync(localFilePath)) {
+            removeFile(localFilePath);
+        } else if (fs.existsSync(downloadedPath)) { // Clean up based on actual downloadedPath
+            removeFile(downloadedPath);
+        }
+    }
+}
+
+
+// Command: /myuploads - List user's uploaded files
+telegramBot.onText(/\/myuploads/, async (msg) => {
+    const chatId = msg.chat.id;
+    const uploads = userUploadsDB[chatId];
+
+    if (!uploads || uploads.length === 0) {
+        await telegramBot.sendMessage(chatId, "You haven't uploaded any files yet. Use /upload to start!");
+        return;
+    }
+
+    let response = "*📂 Your Uploaded Files:*\n\n";
+    uploads.forEach((file, index) => {
+        const uploadDate = new Date(file.uploadDate).toLocaleDateString('en-US', {
+            year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+        response += `${index + 1}. *${file.originalName}*\n`;
+        response += `   _Uploaded: ${uploadDate}_\n`;
+        response += `   [View on Mega.nz](${file.megaUrl})\n\n`;
+    });
+
+    await telegramBot.sendMessage(chatId, response, { parse_mode: 'Markdown', disable_web_page_preview: true });
+});
+
+// Fallback for unknown commands
+telegramBot.on('message', (msg) => {
+    if (msg.text && msg.text.startsWith('/')) {
+        const command = msg.text.split(' ')[0];
+        if (!['/start', '/help', '/about', '/founder', '/origin', '/projects', '/progress', '/contact', '/upload', '/myuploads'].includes(command)) {
+            telegramBot.sendMessage(msg.chat.id, `Sorry, I don't recognize the command \`${command}\`. Please use /help to see the list of available commands.`, { parse_mode: 'Markdown' });
+        }
     }
 });
 
-console.log("Telegram bot started. Waiting for commands!");
+console.log("Edentech Support Bot started. Waiting for commands!");

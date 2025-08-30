@@ -1,13 +1,13 @@
-name: Run Xlegacy Telegram Bot
+name: Run Edentech Support Telegram Bot
 
 on:
   # This workflow can be triggered manually from the GitHub Actions tab
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'How long to run the bot (in minutes)? Max 60 minutes.'
+        description: 'How long to run the bot (in minutes)? (e.g., 481 for 8h + 2s cycle)'
         required: false
-        default: '60' # Default duration if not specified
+        default: '481' # ⭐ UPDATED: Default duration for 8 hours + 2s break
   # Trigger on pushes to the main branch
   push:
     branches:
@@ -17,13 +17,14 @@ jobs:
   run_telegram_bot:
     runs-on: ubuntu-latest
     
-    # ⭐ NEW: Ensure only one instance of this workflow runs at a time
+    # Ensure only one instance of this workflow runs at a time
     concurrency:
       group: bot-runner-${{ github.ref }}
       cancel-in-progress: true
 
     # Set a timeout for the entire job.
-    timeout-minutes: ${{ fromJson(github.event.inputs.duration_minutes || '60') }}
+    # We set it to 481 minutes (8 hours and 1 minute) to cover 4h run + 2s break + 4h run.
+    timeout-minutes: ${{ fromJson(github.event.inputs.duration_minutes || '481') }} # ⭐ UPDATED: Overall job timeout
 
     steps:
     - name: Checkout repository
@@ -35,18 +36,46 @@ jobs:
         node-version: '20'
 
     - name: Install and Update dependencies
-      # ⭐ UPDATED: Use npm update to ensure latest compatible versions
       run: | 
         npm install
         npm update
 
-    - name: Run Telegram Bot
+    - name: Run Telegram Bot (First 4 hours)
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
         MEGA_PASS: ${{ secrets.MEGA_PASS }}
-      run: node bot.js
+      run: |
+        echo "Starting Edentech Support Bot for the first 4 hours..."
+        node bot.js & # Run in the background
+        BOT_PID=$!    # Store the Process ID
+        echo "Bot started with PID $BOT_PID. Waiting for 4 hours..."
+        sleep 4h      # Wait for 4 hours
+        echo "4 hours elapsed. Killing bot process $BOT_PID."
+        kill $BOT_PID # Kill the background process
+        echo "Bot process killed."
+      
+    - name: Take a 2-second break
+      run: |
+        echo "Taking a 2-second break..."
+        sleep 2s
+        echo "Break finished."
+
+    - name: Run Telegram Bot (Second 4 hours)
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+        MEGA_PASS: ${{ secrets.MEGA_PASS }}
+      run: |
+        echo "Restarting Edentech Support Bot for the second 4 hours..."
+        node bot.js & # Run in the background again
+        BOT_PID=$!    # Store the new Process ID
+        echo "Bot started with PID $BOT_PID. Waiting for 4 hours..."
+        sleep 4h      # Wait for another 4 hours
+        echo "4 hours elapsed. Killing bot process $BOT_PID."
+        kill $BOT_PID # Kill the background process
+        echo "Bot process killed. Job completing."
       
     - name: Display end message (if job completes before timeout)
       if: success() || failure()
-      run: echo "Bot job completed or timed out after the specified duration."
+      run: echo "Bot job cycle completed or timed out after the specified duration."
